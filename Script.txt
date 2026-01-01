@@ -1,0 +1,257 @@
+#----------------------------------------------
+#1. Setting Up Analysis Environment
+#----------------------------------------------
+# Create a fresh conda environment
+conda create -n reditools3 python=3.10 -c conda-forge
+ 
+# Activate the environment
+conda activate reditools3
+ 
+# Install essential dependencies
+conda install -c conda-forge build-essential libffi libxml2 libxslt zlib bzip2 lzma ncurses openmpi mpi4py -y
+conda install -c bioconda htslib samtools tabix bedtools gffread -y
+
+# Install REDItools2
+conda install -c bioconda -c conda-forge reditools3 samtools
+
+# Verify installation
+python -c "import reditools; print('REDItools3 ready')"
+samtools --version  # Should be >=1.12
+
+cd /mnt/d/RNA-Editing-Analysis
+
+#----------------------------------------------
+#2. Uncovering RNA Editing Events
+#----------------------------------------------
+#REQUREMENTS: Indexed bam files, reference genome fasta
+
+# Create an output directory
+mkdir /mnt/d/RNA-Editing-Analysis/reditools3_out
+
+# Index your BAM file (if not already done)
+#samtools index your_BAM.bam
+ 
+# 1. Check if index file exists (.bai)
+ls -la Sorted_D8-1.bam* 
+# Should show: Sorted_D8-1.bam  Sorted_D8-1.bam.bai
+
+# 2. Validate BAM + index (reads headers fast)
+samtools quickcheck Sorted_D8-1.bam
+# No output = ✅ good (errors if corrupt/unindexed)
+
+# 3. Test index works (prints chr stats instantly)
+samtools idxstats Sorted_D8-1.bam | head
+# Output: chr1  249250621  12345  67    (ref, len, mapped, unmapped)
+# Instant = ✅ indexed correctly
+# "read through entire file" warning = no index
+
+# 4. Confirm sorted (header check)
+samtools view -H Sorted_D8-1.bam | grep SO
+# @HD VN:1.6 SO:coordinate  → ✅ sorted by coord
+
+# Run REDItools3 analysis
+python -m reditools analyze \
+    -r GRCm38.genome.fa \
+    -o /mnt/d/RNA-Editing-Analysis/reditools3_out/REDITools3_Outputs_D8-1.tsv \
+    Sorted_D8-1.bam
+
+
+# ============================================================
+# Understanding REDItools3 Output
+# ============================================================
+# REDItools3 generates a tab-separated output file where each
+# row corresponds to a potential RNA editing site.
+# Below is an explanation of the key columns.
+# ============================================================
+
+
+# -----------------------------
+# Location Information
+# -----------------------------
+
+# Region
+# Chromosome or contig identifier
+# Examples: chr1, chr2, chrX, chrY
+
+# Position
+# 1-based genomic coordinate of the site
+
+# Reference
+# Reference nucleotide in the genome at this position
+# (A, C, G, or T)
+
+# Strand
+# Strand on which the site is detected
+# "+" = forward strand
+# "-" = reverse strand
+
+
+# -----------------------------
+# Quality Metrics
+# -----------------------------
+
+# Coverage-q30
+# Number of reads covering the site with base quality ≥ Q30
+# High values indicate reliable support
+
+# MeanQ
+# Mean Phred base quality score of reads covering the site
+
+# BaseCount
+# Count of each nucleotide observed at the site
+# Format example: A:10 C:0 G:5 T:0
+
+
+# -----------------------------
+# Editing Details
+# -----------------------------
+
+# AllSubs
+# All observed nucleotide substitutions at this site
+# Example: A>G
+
+# Frequency
+# Editing frequency (editing ratio)
+# Calculated as:
+#   edited_reads / total_high_quality_reads
+#
+# Example:
+#   If A>G and:
+#     G_reads = 5
+#     Coverage-q30 = 20
+#   Frequency = 5 / 20 = 0.25
+
+
+# -----------------------------
+# Interpretation Notes
+# -----------------------------
+
+# A>G substitutions on the + strand (or T>C on the - strand)
+# typically indicate A-to-I RNA editing.
+
+# Sites with:
+# - low Coverage-q30
+# - low MeanQ
+# - very low Frequency
+# should be filtered out during post-processing.
+
+# Recommended downstream filters:
+# - Minimum coverage threshold (e.g., ≥10)
+# - Minimum editing frequency (e.g., ≥0.1)
+# - Removal of known SNPs and repetitive regions
+
+#--------------------------------
+#2. Statistical Analysis of Differential Editing
+#--------------------------------
+
+#__________________In R Studio__________________#
+library(data.table)
+library(limma)
+library(edgeR)
+ 
+# Import REDItools2 results
+redi_dt <- lapply(list.files("/mnt/d/RNA-Editing-Analysis/reditools3_out", 
+                            "REDITools3_Outputs_.*.tsv", 
+                            full.names = T), 
+                  fread, 
+                  data.table = F)
+  
+ 
+# Name your samples
+names(redi_dt) <- gsub("REDITools3_Outputs_|\\.tsv", "", 
+                       list.files("/mnt/d/RNA-Editing-Analysis/reditools3_out", 
+                                "REDITools3_Outputs_.*.tsv"))
+ 
+ 
+# Filter and process editing sites
+redi_dt <- lapply(redi_dt, \(x) {
+    x[x$`Coverage-q30` >= 10 & x$Frequency >= 0.01, ]     #0.05 can also be set
+})
+ 
+# Create unique identifiers
+redi_dt <- lapply(redi_dt, \(x) {
+    x$EventID <- paste(x$Region, x$Position, x$AllSubs, sep = "_")
+    return(x[, c("EventID", "Frequency")])
+})
+ 
+# Rename the frequency column of each table
+redi_dt <- mapply(\(x, y) {colnames(x)[2] <- y; return(x)}, 
+                  redi_dt, names(redi_dt), SIMPLIFY = F)
+ 
+ 
+# Merge editing results
+redi_dt_merge <- Reduce(\(x, y) merge(x, y, by = "EventID", all = TRUE), redi_dt)
+ 
+redi_dt_merge <- na.omit(redi_dt_merge)
+ 
+rownames(redi_dt_merge) <- redi_dt_merge$EventID
+ 
+redi_dt_merge <- redi_dt_merge[, -1]
+ 
+ 
+# Remove unchanging editing sites 
+redi_dt_merge <- redi_dt_merge[apply(redi_dt_merge, 1, \(x) length(unique(x)) > 1), ]
+ 
+# Normalize the editing frequencies
+redi_dt_merge <- apply(redi_dt_merge, 2, function(col) asin(sqrt(col)))
+ 
+ 
+# Make sample information table
+meta <- data.frame(SampleID = colnames(redi_dt_merge),
+                   Treatment = c("MDI", "MDI","MDI", "DMSO", "DMSO", "DMSO"))
+rownames(meta) <- meta$SampleID
+ 
+# Make DGEList by combing sample information and the editing frequencies
+dge <- DGEList(counts=redi_dt_merge, samples = meta)
+
+
+
+
+# Set up your experimental design
+design <- model.matrix(~ 0 + dge$samples[["Treatment"]])
+colnames(design) <- gsub(".*]]", "", colnames(design))
+ 
+# Create contrast matrix
+comparison <- "MDI - DMSO"
+contrast_matrix <- makeContrasts(contrasts = comparison, 
+                                levels = design)
+ 
+# Fit statistical model
+fit <- lmFit(dge$counts, design)
+fit_2 <- contrasts.fit(fit, contrast_matrix)
+fit_2 <- eBayes(fit_2)
+ 
+# Extract results
+deg_tbl <- topTable(fit_2, 
+                    coef = colnames(contrast_matrix), 
+                    n = Inf, 
+                    p.value=1, 
+                    lfc=0, 
+                    sort.by = "p")
+ 
+# Save the results
+fwrite(deg_tbl, "Diff_Editing_P1_lfc0.tsv", sep = "\t", row.names = T)
+ 
+# Make a bed file for the differential results for annotation purpose
+deg_bed <- data.frame(sapply(strsplit(rownames(deg_tbl), "_"), "[[", 1), sapply(strsplit(rownames(deg_tbl), "_"), "[[", 2), sapply(strsplit(rownames(deg_tbl), "_"), "[[", 2))
+ 
+fwrite(deg_bed, "Diff_Editing_P1_lfc0.bed", sep = "\t", col.names = F)
+
+#--------------------------------
+#3. Annotating the Differential Editing Sites
+#--------------------------------
+
+# Convert genomic annotation file (GTF) to bed format
+gffread gencode.vM25.annotation.gtf -T -o gencode.vM25.annotation.bed
+ 
+# Annotate differential editing sites
+bedtools intersect -a Diff_Editing_P1_lfc0.bed -b gencode.vM25.annotation.bed -wa -wb > annotated_Diff_Editing_P1_lfc0.bed
+
+
+
+
+
+
+
+
+
